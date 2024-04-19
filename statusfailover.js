@@ -17,5 +17,5 @@ async function handleRequest(request) {
   } else {
       var failoverURL = new URL(request.url)
       failoverURL.hostname = "status2.antaresnetwork.com"
-    r  eturn fetch(failoverURL, request, { cf: { resolveOverride: 'status.antaresnetwork.com' } })
+    return fetch(failoverURL, request, { cf: { resolveOverride: 'status.antaresnetwork.com' } })
 }}
