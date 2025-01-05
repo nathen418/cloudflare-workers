@@ -1,3 +1,4 @@
+//This worker looks for requests to the primary page of status.antaresnetwork.com and if the request times out after 5 seconds, proxies the traffic to status2.antaresnetwork.com.
 addEventListener("fetch", event => {
   event.respondWith(handleRequest(event.request));
 });
