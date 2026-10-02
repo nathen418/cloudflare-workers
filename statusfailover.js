@@ -8,7 +8,7 @@ const BACKENDS = [
   { host: "status3.antaresnetwork.com", timeoutMs: 5000 },
 ];
 
-const UNHEALTHY_TTL_MS = 30_000;
+const UNHEALTHY_TTL_MS = 30000;
 
 const unhealthyUntil = new Map();
 
