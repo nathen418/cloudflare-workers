@@ -1,78 +1,84 @@
-//This cloudflare worker responds to requests to status.antaresnetwork.com and proxies them to status1.antaresnetwork.com.
-//If the request fails after 2 seconds, then the requests are proxied to the alternate page at status2.antaresnetwork.com.
+// Cloudflare Worker: status.antaresnetwork.com
+// Proxies to the first healthy backend, failing over in priority order.
+// A backend is skipped for UNHEALTHY_TTL_MS after a failure (per-isolate cache).
 
-// In-memory health cache (per Cloudflare Worker isolate)
-let primaryIsHealthy = true;
-let lastHealthCheck = 0;
+const BACKENDS = [
+  { host: "status1.antaresnetwork.com", timeoutMs: 2000 },
+  { host: "status2.antaresnetwork.com", timeoutMs: 2500 },
+  { host: "status3.antaresnetwork.com", timeoutMs: 5000 },
+];
 
-const PRIMARY_HOST = "status1.antaresnetwork.com";
-const SECONDARY_HOST = "status2.antaresnetwork.com";
-const HEALTH_CACHE_TTL = 30_000; // 30 seconds
-const FETCH_TIMEOUT_MS = 2000;   // 2 seconds
+const UNHEALTHY_TTL_MS = 30_000;
 
-addEventListener("fetch", event => {
-  event.respondWith(handleRequest(event.request));
-});
+const unhealthyUntil = new Map();
 
-async function handleRequest(request) {
-  const now = Date.now();
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const isWebSocket = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
 
-  // If we recently marked primary as down, skip it for TTL period
-  if (!primaryIsHealthy && now - lastHealthCheck < HEALTH_CACHE_TTL) {
-    return fetchFromHost(request, SECONDARY_HOST);
-  }
+    const body = ["GET", "HEAD"].includes(request.method)
+      ? undefined
+      : await request.arrayBuffer();
 
-  try {
-    const response = await fetchFromHost(request, PRIMARY_HOST, true);
-    // Primary worked, mark it healthy
-    primaryIsHealthy = true;
-    lastHealthCheck = now;
-    return response;
-  } catch (err) {
-    // Primary failed — mark unhealthy and switch to failover
-    primaryIsHealthy = false;
-    lastHealthCheck = now;
-    return fetchFromHost(request, SECONDARY_HOST);
-  }
-}
+    const init = {
+      method: request.method,
+      headers: request.headers,
+      body,
+      redirect: "manual",
+    };
 
-async function fetchFromHost(request, host, useTimeout = false) {
-  const isWebSocket = request.headers.get("Upgrade") === "websocket";
-  const url = new URL(request.url);
-  url.hostname = host;
+    const now = Date.now();
+    const isHealthy = (b) => (unhealthyUntil.get(b.host) ?? 0) <= now;
+    const candidates = [
+      ...BACKENDS.filter(isHealthy),
+      ...BACKENDS.filter((b) => !isHealthy(b)),
+    ];
 
-  const reqInit = {
-    method: request.method,
-    headers: request.headers,
-    redirect: "follow",
-    body: request.bodyUsed ? null : request.body
-  };
+    let lastError;
+    let lastResponse;
 
-  if (isWebSocket) {
-    // WebSocket mode: connect directly, no timeout
-    const wsResponse = await fetch(`https://${host}${url.pathname}${url.search}`, reqInit);
-    if (!wsResponse.ok || wsResponse.status >= 500) {
-      throw new Error(`WebSocket connection failed to ${host}`);
+    for (const backend of candidates) {
+      try {
+        const response = await fetchWithTimeout(buildUrl(backend.host, url), init, backend.timeoutMs);
+
+        const ok = isWebSocket
+          ? response.status === 101
+          : response.status === 200 || (response.status >= 300 && response.status < 400);
+
+        if (!ok) {
+          lastResponse?.body?.cancel();
+          lastResponse = response;
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        unhealthyUntil.delete(backend.host);
+        return response;
+      } catch (err) {
+        lastError = err;
+        unhealthyUntil.set(backend.host, Date.now() + UNHEALTHY_TTL_MS);
+        console.log(`${backend.host} failed: ${err.message}`);
+      }
     }
-    return wsResponse;
+
+    if (lastResponse) return lastResponse;
+    return new Response(`All backends failed: ${lastError?.message ?? "unknown"}`, { status: 502 });
+  },
+};
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") throw new Error(`Timeout after ${timeoutMs}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-
-  // HTTP(S) mode
-  const targetUrl = `https://${host}${url.pathname}${url.search}`;
-  const response = useTimeout
-    ? await fetchWithTimeout(targetUrl, reqInit, FETCH_TIMEOUT_MS)
-    : await fetch(targetUrl, reqInit);
-
-  if (!response.ok || response.status >= 500) {
-    throw new Error(`Primary server error ${response.status}`);
-  }
-
-  return response;
 }
 
-function fetchWithTimeout(url, options, timeoutMs) {
-  return Promise.race([
-    fetch(url, options),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), timeoutMs))
-  ]);
+function buildUrl(host, url) {
+  return `https://${host}${url.pathname}${url.search}`;
 }
